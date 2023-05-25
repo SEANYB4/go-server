@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"strings"
 	"github.com/SEANYB4/go-server/internal/database"
+	
 )
 
 
@@ -46,22 +47,15 @@ func (cfg *apiConfig) numberRequests(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 
+	db := NewDB("database.json")
 	apiCfg := &apiConfig{
 		FileserverHits: 0,
 	}
-
-
 	r := chi.NewRouter()
-
 	apiRouter := chi.NewRouter()
-
-	adminRouter := chi.NewRouter()
-
-	
+	adminRouter := chi.NewRouter()	
 	dir := "."
 	fileServer := http.FileServer(http.Dir(dir))
-
-	
 	
 	r.Mount("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -72,9 +66,7 @@ func main() {
 		apiCfg.middlewareMetricsInc(fileServer).ServeHTTP(w, r)
 	}))
 
-
 	r.Mount("/admin", adminRouter)
-
 	r.Mount("/api", apiRouter)
 
 	// mux is a http multiplexer??
@@ -92,16 +84,6 @@ func main() {
 	apiRouter.Post("/validate_chirp", checkLengthOfChirp)
 	apiRouter.Post("/chirps", createChirp)
 
-	
-
-	// adminRouter.Get("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	// 	w.Header().Set("Content-Type", "text/html")
-	// 	fmt.Println("HELLO")
-	// 	fileServer.ServeHTTP(w, r)
-		
-	// }))
-
-
 	adminRouter.Mount("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
 		if r.Method != "GET" {
@@ -110,17 +92,12 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "text/html")
 		
-
 		tmpl := template.Must(template.ParseFiles("./admin/metrics/index.html"))
 		err := tmpl.Execute(w, apiCfg)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		
-		fmt.Println("HELLO")
-		// fileServer.ServeHTTP(w, r)
 	}))
 	
 	// mux.Handle("/", apiCfg.middlewareMetricsInc())
@@ -230,13 +207,6 @@ func createChirp(w http.ResponseWriter, r *http.Request) {
 
 	type responseBody map[string]string
 
-
-	type database struct {
-
-	}
-	
-
-
 	decoder := json.NewDecoder(r.Body)
 	params := parameters{}
 	err := decoder.Decode(&params)
@@ -263,8 +233,8 @@ func createChirp(w http.ResponseWriter, r *http.Request) {
 
 		}
 		cleaned = strings.Join(words)
-
 		chirp := CreateChirp(cleaned)
+
 
 
 	}
