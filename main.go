@@ -10,6 +10,14 @@ import (
 	"encoding/json"
 	"strings"
 	"github.com/SEANYB4/go-server/internal/database"
+	"sort"
+	"strconv"
+	"golang.org/x/crypto/bcrypt"
+	// "github.com/google/uuid"
+	"github.com/joho/godotenv"
+	"os"
+	"github.com/golang-jwt/jwt/v5"
+	"time"
 	
 )
 
@@ -18,7 +26,17 @@ import (
 type apiConfig struct {
 
 	FileserverHits int
+	Database database.DB
+	ChirpID int
+	UserID int
+	DatabaseMap database.DBStructure
+	JWT_SECRET string
 
+}
+
+type ChirpResponse struct{
+	id int
+	body string
 }
 
 
@@ -47,9 +65,19 @@ func (cfg *apiConfig) numberRequests(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 
-	db := NewDB("database.json")
+	godotenv.Load()
+
+
 	apiCfg := &apiConfig{
 		FileserverHits: 0,
+		Database: *database.NewDB("database.json"),
+		ChirpID: 1,
+		UserID: 1,
+		DatabaseMap : database.DBStructure{
+			Chirps: map[int]database.Chirp{},
+			Users: map[int]database.User{},
+		},
+		JWT_SECRET: os.Getenv("JWT_SECRET"),
 	}
 	r := chi.NewRouter()
 	apiRouter := chi.NewRouter()
@@ -82,7 +110,11 @@ func main() {
 	apiRouter.Get("/healthz", readinessCheck)
 	apiRouter.Get("/metrics", apiCfg.numberRequests)
 	apiRouter.Post("/validate_chirp", checkLengthOfChirp)
-	apiRouter.Post("/chirps", createChirp)
+	apiRouter.Post("/chirps", apiCfg.createChirp)
+	apiRouter.Get("/chirps", apiCfg.getChirps)
+	apiRouter.Get("/chirps/{chirpID}", apiCfg.getChirpFromID)
+	apiRouter.Post("/users", apiCfg.createUser)
+	apiRouter.Post("/login", apiCfg.login)
 
 	adminRouter.Mount("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -199,7 +231,68 @@ func middlewareCors(next http.Handler) http.Handler{
 	})
 }
 
-func createChirp(w http.ResponseWriter, r *http.Request) {
+func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Email string
+		Password string
+	}
+
+	type responseBody map[string]string
+	type responseBody2 struct{
+		ID int
+		Email string
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, 500, responseBody{
+			"error": "Something went wrong",
+		})
+	}
+	id := cfg.UserID
+	cfg.UserID += 1
+	var email string = params.Email
+	var password string = params.Password
+
+	for i := range cfg.DatabaseMap.Users {
+		if cfg.DatabaseMap.Users[i].Email == email {
+			respondWithError(w, 500, responseBody{
+			"error": "User already registered",
+		})
+		}
+	}
+
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 5)
+	if err != nil {
+		respondWithError(w, 500, responseBody{
+			"error": "Something went wrong",
+		})
+	}
+
+	hashPass := string(hash)
+
+
+	user := database.User{
+		ID: id,
+		Email: email,
+		HashedPassword: hashPass,
+	}
+
+
+	cfg.DatabaseMap.Users[id] = user
+	cfg.Database.WriteDB(cfg.DatabaseMap)
+		
+	respondWithJSON(w, 201, responseBody2{
+		ID: user.ID,
+		Email: user.Email,
+	})
+
+}
+
+func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 
 	type parameters struct {
 		Body string `json:"body"`
@@ -232,13 +325,135 @@ func createChirp(w http.ResponseWriter, r *http.Request) {
 			}
 
 		}
-		cleaned = strings.Join(words)
-		chirp := CreateChirp(cleaned)
+		idForInsert := cfg.ChirpID
+		cfg.ChirpID += 1
+		cleaned := strings.Join(words, " ")
+		chirp, err := cfg.Database.CreateChirp(cleaned, idForInsert)
+		if err != nil {
+			fmt.Println("Error: ", err)
+		}
 
-
-
+		cfg.DatabaseMap.Chirps[idForInsert] = chirp
+		cfg.Database.WriteDB(cfg.DatabaseMap)
+		
+		respondWithJSON(w, 201, chirp)
 	}
-
 }
 
 
+func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
+
+	returnArray := make([]database.Chirp, 0)
+
+	for i := range cfg.DatabaseMap.Chirps {
+		returnArray = append(returnArray, cfg.DatabaseMap.Chirps[i])
+	}
+
+	sort.Slice(returnArray, func(i, j int) bool { return returnArray[i].ID < returnArray[j].ID })
+	respondWithJSON(w, 200, returnArray)
+}
+
+
+func (cfg *apiConfig) getChirpFromID(w http.ResponseWriter, r *http.Request) {
+	type responseBody map[string]string
+
+	id := chi.URLParam(r, "chirpID")
+	intId, err := strconv.Atoi(id)
+	if err != nil {
+		fmt.Println("Error: ", err)
+		return
+	}
+
+	chirp := cfg.DatabaseMap.Chirps[intId]
+
+	if chirp.ID == 0 {
+		respondWithError(w, 404, responseBody{
+			"error": "id not found",
+		})
+		return
+	}
+	respondWithJSON(w, 200, chirp)
+}
+
+
+func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
+
+	type parameters struct {
+		
+		Password string
+		Email string
+		Expires int
+	}
+	type responseBody map[string]string
+	type responseBody2 struct{
+		ID int
+		Email string
+		Token string
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, 400, responseBody{
+			"error": "Something went wrong",
+		})
+		return
+	}
+
+	expires := params.Expires
+	if expires == 0 {
+		expires = int(time.Hour * 24)
+	} else if expires > (24*60*60) {
+		expires = int(time.Hour * 24)
+	}
+
+	email := params.Email
+	password := []byte(params.Password)
+
+	for i := range cfg.DatabaseMap.Users {
+		if cfg.DatabaseMap.Users[i].Email == email {
+			err := bcrypt.CompareHashAndPassword([]byte(cfg.DatabaseMap.Users[i].HashedPassword), password)
+			
+			if err != nil {
+				respondWithError(w, 401, responseBody{
+					"error": "Password incorrect",
+				})
+				return
+			} else {
+
+
+				// Create a JWT
+				token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+					Issuer: "chirpy",
+					IssuedAt: jwt.NewNumericDate(time.Now()),
+					ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(expires))),
+					Subject: string(cfg.DatabaseMap.Users[i].ID),
+				})
+				fmt.Println(token)
+
+
+				// Sign the token with a secret key
+				signedToken, err := token.SignedString(os.Getenv("JWT_SECRET"))
+				if err != nil {
+					fmt.Println("Error signing token")
+				}
+
+
+				respondWithJSON(w, 200, responseBody2{
+					ID: cfg.DatabaseMap.Users[i].ID,
+					Email: cfg.DatabaseMap.Users[i].Email,
+					Token: signedToken,
+				})
+				return
+			}
+
+		}
+	}
+
+
+	respondWithError(w, 404, responseBody{
+		"error": "User not found",
+	})
+
+}
