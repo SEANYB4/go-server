@@ -115,6 +115,7 @@ func main() {
 	apiRouter.Get("/chirps/{chirpID}", apiCfg.getChirpFromID)
 	apiRouter.Post("/users", apiCfg.createUser)
 	apiRouter.Post("/login", apiCfg.login)
+	apiRouter.Put("/users", apiCfg.updateUser)
 
 	adminRouter.Mount("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -455,5 +456,28 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 	respondWithError(w, 404, responseBody{
 		"error": "User not found",
 	})
+
+}
+
+
+
+func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
+
+
+	authHeader := r.Header.Get("Authorization")
+
+
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer") {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Println(w, "Invalid or missing authorization token")
+		return
+	}
+
+	fmt.Println("Hello")
+	// Extract the token string from the Authorization header by stripping off the Bearer prefix
+	// tokenString := authHeader[len("Bearer"):]
+
+
+
 
 }
