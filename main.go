@@ -19,6 +19,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"time"
 	
+	
 )
 
 
@@ -383,7 +384,7 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 		
 		Password string
 		Email string
-		Expires int
+		Expires int `json:"expires_in_seconds"`
 	}
 	type responseBody map[string]string
 	type responseBody2 struct{
@@ -403,6 +404,7 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	expires := params.Expires
+	fmt.Println(expires)
 	if expires == 0 {
 		expires = int(time.Hour * 24)
 	} else if expires > (24*60*60) {
@@ -429,15 +431,17 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 					Issuer: "chirpy",
 					IssuedAt: jwt.NewNumericDate(time.Now()),
 					ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(expires))),
-					Subject: string(cfg.DatabaseMap.Users[i].ID),
+					Subject: fmt.Sprint(cfg.DatabaseMap.Users[i].ID),
 				})
-				fmt.Println(token)
+				
 
 
 				// Sign the token with a secret key
-				signedToken, err := token.SignedString(os.Getenv("JWT_SECRET"))
+				secretKey := []byte(cfg.JWT_SECRET)
+				signedToken, err := token.SignedString(secretKey)
+
 				if err != nil {
-					fmt.Println("Error signing token")
+					fmt.Println("Error signing token: ", err)
 				}
 
 
@@ -464,20 +468,123 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
 
 
+	type responseBody map[string]string
+	type responseBody2 struct{
+		ID int `json:"id"`
+		Email string `json:"email"`
+
+	}
+	
+
+	type parameters struct {
+		Email string `json:"email"`
+		Password string `json:"password"`
+	}
 	authHeader := r.Header.Get("Authorization")
 
 
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer") {
-		w.WriteHeader(http.StatusUnauthorized)
+		respondWithError(w, http.StatusUnauthorized, responseBody{
+			"error": "Couldn't find JWT",
+		})
 		fmt.Println(w, "Invalid or missing authorization token")
 		return
 	}
 
-	fmt.Println("Hello")
+	
 	// Extract the token string from the Authorization header by stripping off the Bearer prefix
-	// tokenString := authHeader[len("Bearer"):]
+	tokenString := authHeader[len("Bearer "):]
+
+	// Parse the token using the jwt.ParseWithClaims function
+	keyFunc := func(token *jwt.Token) (interface{}, error) {
+		return []byte(cfg.JWT_SECRET), nil
+	}
+
+	claims := jwt.RegisteredClaims{}
+
+	token, err := jwt.ParseWithClaims(tokenString, &claims, keyFunc)
+
+	// Check if the token is valid
+	if err != nil || !token.Valid {
+
+		respondWithError(w, 401, responseBody{
+			"error": fmt.Sprint(err),
+		})
+		return
+	}
+
+
+	// Extract the claims
+	myClaims, ok := token.Claims.(*jwt.RegisteredClaims)
+	if !ok {
+		respondWithError(w, 500, responseBody{
+			"error": "Internal server error",
+		})
+		return
+	}
 
 
 
+	// ******************************************************
+	// Check the expiration time
+	expTime := myClaims.ExpiresAt
+	
+
+	fmt.Println(expTime)
+	if expTime.Before(time.Now()) {
+        respondWithError(w, 401, responseBody{
+			"error": "Token expired",
+		})
+		return
+    }
+	
+
+
+	id := myClaims.Subject
+	idForCompare, err := strconv.Atoi(id)
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err = decoder.Decode(&params)
+	if err != nil {
+
+		respondWithJSON(w, 500, responseBody{
+			"error": "Something went wrong",
+		})
+		return
+	}
+
+	
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(params.Password), 5)
+	if err != nil {
+		respondWithError(w, 500, responseBody{
+			"error": "Something went wrong",
+		})
+	}
+
+	hashPass := string(hash)
+
+	user := database.User{
+		ID: idForCompare,
+		Email: params.Email,
+		HashedPassword: hashPass,
+	}
+
+
+	
+	for i := range cfg.DatabaseMap.Users { 
+		if cfg.DatabaseMap.Users[i].ID == idForCompare {
+			cfg.DatabaseMap.Users[i] = user
+			cfg.Database.WriteDB(cfg.DatabaseMap)
+			respondWithJSON(w, 200, responseBody2{
+				ID: user.ID,
+				Email: user.Email,
+			})
+			return
+		}
+	}
+
+	
 
 }
