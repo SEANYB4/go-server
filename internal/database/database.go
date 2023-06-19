@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 	
 )
 
@@ -18,8 +19,9 @@ type DB struct {
 
 
 type Chirp struct {
-	ID int
-	Body string
+	ID int `json:"id"`
+	Body string `json:"body"`
+	AuthorID int `json:"author_id"`
 }
 
 
@@ -27,12 +29,19 @@ type User struct {
 	ID int
 	Email string
 	HashedPassword string
+	Is_Chirpy_Red bool
 }
 
 type DBStructure struct {
 
 	Chirps map[int]Chirp `json:"chirps"`
 	Users map[int]User `json:"users"`
+	RevokedRefreshTokens map[string]RevokedToken `json:"revokedTokens"`
+}
+
+type RevokedToken struct {
+	ID string
+	Time time.Time
 }
 
 
@@ -52,11 +61,12 @@ func NewDB(path string) (*DB) {
 
 
 // // CreateChirp creates a new chirp and saves it to disk
-func (db *DB) CreateChirp(body string, id int) (Chirp, error) {
+func (db *DB) CreateChirp(body string, id int, userID int) (Chirp, error) {
 
 	chirp := Chirp{
 		ID: id,
 		Body: body,
+		AuthorID: userID,
 	}
 
 	file, _ := json.MarshalIndent(chirp, "", " ")

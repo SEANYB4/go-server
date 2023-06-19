@@ -32,6 +32,7 @@ type apiConfig struct {
 	UserID int
 	DatabaseMap database.DBStructure
 	JWT_SECRET string
+	POLKA_KEY string
 
 }
 
@@ -77,8 +78,10 @@ func main() {
 		DatabaseMap : database.DBStructure{
 			Chirps: map[int]database.Chirp{},
 			Users: map[int]database.User{},
+			RevokedRefreshTokens: map[string]database.RevokedToken{},
 		},
 		JWT_SECRET: os.Getenv("JWT_SECRET"),
+		POLKA_KEY: os.Getenv("POLKA_KEY"),
 	}
 	r := chi.NewRouter()
 	apiRouter := chi.NewRouter()
@@ -117,6 +120,10 @@ func main() {
 	apiRouter.Post("/users", apiCfg.createUser)
 	apiRouter.Post("/login", apiCfg.login)
 	apiRouter.Put("/users", apiCfg.updateUser)
+	apiRouter.Post("/refresh", apiCfg.refresh)
+	apiRouter.Post("/revoke", apiCfg.revoke)
+	apiRouter.Delete("/chirps/{chirpID}", apiCfg.deleteChirp)
+	apiRouter.Post("/polka/webhooks", apiCfg.polka)
 
 	adminRouter.Mount("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -281,6 +288,7 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 		ID: id,
 		Email: email,
 		HashedPassword: hashPass,
+		Is_Chirpy_Red: false,
 	}
 
 
@@ -302,13 +310,67 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 
 	type responseBody map[string]string
 
+
+	authHeader := r.Header.Get("Authorization")
+
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer") {
+		
+		respondWithError(w, http.StatusUnauthorized, responseBody{
+
+			"error": "User unauthenticated",
+		})
+		return
+	}
+
+	tokenString := authHeader[len("Bearer "):]
+
+	// Parse the token using the jwt.ParseWithClaims function
+	keyFunc := func(token *jwt.Token) (interface{}, error) {
+		return []byte(cfg.JWT_SECRET), nil
+	}
+
+	claims := jwt.RegisteredClaims{}
+	token, err := jwt.ParseWithClaims(tokenString, &claims, keyFunc)
+	
+	// check if the token is valid
+
+	if err != nil || !token.Valid {
+		
+		respondWithError(w, 401, responseBody{
+			"error": "Token invalid",
+		})
+		return
+	}
+
+	// Extract the claims
+
+	myClaims, ok := token.Claims.(*jwt.RegisteredClaims)
+	if !ok {
+		respondWithError(w, 500, responseBody{
+			"error": "Something went wrong",
+		})
+		return
+	}
+
+	userID, err := strconv.Atoi(myClaims.Subject)
+	
+	
+	if err != nil {
+		respondWithError(w, 500, responseBody{
+			"error": "Error parsing user ID",
+		})
+		return
+	}
+
+
 	decoder := json.NewDecoder(r.Body)
 	params := parameters{}
-	err := decoder.Decode(&params)
+	err = decoder.Decode(&params)
 	if err != nil {
 		respondWithError(w, 400, responseBody{
 			"error": "Something went wrong",
 		})
+		return
 	} 
 
 	var msg string = params.Body
@@ -316,6 +378,7 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, 400, responseBody{
 			"error": "Chirp is too long",
 		})
+		return
 	} else {
 
 		words := strings.Split(msg, " ")
@@ -330,9 +393,10 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 		idForInsert := cfg.ChirpID
 		cfg.ChirpID += 1
 		cleaned := strings.Join(words, " ")
-		chirp, err := cfg.Database.CreateChirp(cleaned, idForInsert)
+		chirp, err := cfg.Database.CreateChirp(cleaned, idForInsert, userID)
 		if err != nil {
 			fmt.Println("Error: ", err)
+			return
 		}
 
 		cfg.DatabaseMap.Chirps[idForInsert] = chirp
@@ -345,13 +409,40 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 
 func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
 
-	returnArray := make([]database.Chirp, 0)
+	type responseBody map[string]string
 
-	for i := range cfg.DatabaseMap.Chirps {
-		returnArray = append(returnArray, cfg.DatabaseMap.Chirps[i])
+	authorIDString := r.URL.Query().Get("author_id")
+	
+	authorIDInt, err := strconv.Atoi(authorIDString)
+	if err != nil {
+		fmt.Println("Error parsing authorID into int format")
 	}
 
-	sort.Slice(returnArray, func(i, j int) bool { return returnArray[i].ID < returnArray[j].ID })
+	sortOrder := r.URL.Query().Get("sort")
+
+
+
+	returnArray := make([]database.Chirp, 0)
+
+	if authorIDString == "" {
+		for i := range cfg.DatabaseMap.Chirps {
+			returnArray = append(returnArray, cfg.DatabaseMap.Chirps[i])
+		}
+	} else {
+		for i := range cfg.DatabaseMap.Chirps {
+			if cfg.DatabaseMap.Chirps[i].AuthorID == authorIDInt {
+				returnArray = append(returnArray, cfg.DatabaseMap.Chirps[i])
+			}
+		}
+	}
+	
+	if sortOrder == "asc" || sortOrder == "" {
+		sort.Slice(returnArray, func(i, j int) bool { return returnArray[i].ID < returnArray[j].ID })
+	} else {
+		sort.Slice(returnArray, func(i, j int) bool { return returnArray[i].ID > returnArray[j].ID })
+	}
+
+	
 	respondWithJSON(w, 200, returnArray)
 }
 
@@ -388,9 +479,11 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 	}
 	type responseBody map[string]string
 	type responseBody2 struct{
-		ID int
-		Email string
-		Token string
+		ID int `json:"id"`
+		Email string `json:"email"`
+		AccessToken string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
+		Is_Chirpy_Red bool `json:"is_chirpy_red"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -404,7 +497,6 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	expires := params.Expires
-	fmt.Println(expires)
 	if expires == 0 {
 		expires = int(time.Hour * 24)
 	} else if expires > (24*60*60) {
@@ -426,29 +518,57 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 			} else {
 
 
-				// Create a JWT
-				token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-					Issuer: "chirpy",
+				// Create an access JWT
+				accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+					Issuer: "chirpy-access",
 					IssuedAt: jwt.NewNumericDate(time.Now()),
-					ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(expires))),
+					ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
 					Subject: fmt.Sprint(cfg.DatabaseMap.Users[i].ID),
+				})
+
+				// Create a refresh JWT
+				refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+					Issuer: "chirpy-refresh",
+					IssuedAt: jwt.NewNumericDate(time.Now()),
+					ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration((time.Hour*24)*60))),
+					Subject : fmt.Sprint(cfg.DatabaseMap.Users[i].ID),
 				})
 				
 
 
-				// Sign the token with a secret key
+				// Sign the access token with a secret key
 				secretKey := []byte(cfg.JWT_SECRET)
-				signedToken, err := token.SignedString(secretKey)
+				signedAccessToken, err := accessToken.SignedString(secretKey)
+				
 
 				if err != nil {
-					fmt.Println("Error signing token: ", err)
+					fmt.Println("Error signing access token: ", err)
+					respondWithError(w, 500, responseBody{
+						"error": "Internal Server Error",
+					})
+					return
 				}
 
+				// Sign the refresh token with a secret key
+				signedRefreshToken, err := refreshToken.SignedString(secretKey)
+
+				if err != nil {
+					fmt.Println("Error signing refesh token: ", err)
+					respondWithError(w, 500, responseBody{
+						"error": "Internal Server Error",
+					})
+					return
+				}
+
+				
 
 				respondWithJSON(w, 200, responseBody2{
 					ID: cfg.DatabaseMap.Users[i].ID,
 					Email: cfg.DatabaseMap.Users[i].Email,
-					Token: signedToken,
+					AccessToken: signedAccessToken,
+					RefreshToken: signedRefreshToken,
+					Is_Chirpy_Red: cfg.DatabaseMap.Users[i].Is_Chirpy_Red,
+
 				})
 				return
 			}
@@ -481,13 +601,13 @@ func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	authHeader := r.Header.Get("Authorization")
+	
 
 
-	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer") {
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer") || len(authHeader)<=7{
 		respondWithError(w, http.StatusUnauthorized, responseBody{
 			"error": "Couldn't find JWT",
 		})
-		fmt.Println(w, "Invalid or missing authorization token")
 		return
 	}
 
@@ -529,8 +649,6 @@ func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
 	// Check the expiration time
 	expTime := myClaims.ExpiresAt
 	
-
-	fmt.Println(expTime)
 	if expTime.Before(time.Now()) {
         respondWithError(w, 401, responseBody{
 			"error": "Token expired",
@@ -538,6 +656,17 @@ func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
 		return
     }
 	
+
+	// Check if token is an access token
+
+	issuer := myClaims.Issuer
+
+	if issuer != "chirpy-access" {
+		respondWithError(w, 401, responseBody{
+			"error": "No access token provided",
+		})
+		return
+	}
 
 
 	id := myClaims.Subject
@@ -548,7 +677,7 @@ func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
 	err = decoder.Decode(&params)
 	if err != nil {
 
-		respondWithJSON(w, 500, responseBody{
+		respondWithError(w, 500, responseBody{
 			"error": "Something went wrong",
 		})
 		return
@@ -587,4 +716,295 @@ func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
 
 	
 
+}
+
+
+
+func (cfg *apiConfig) refresh(w http.ResponseWriter, r *http.Request) {
+
+	type responseBody map[string]string
+	type responseBody2 struct{
+		Token string `json:"token"`
+	}
+	
+
+	authHeader := r.Header.Get("Authorization")
+
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer") || len(authHeader)<=7{
+		respondWithError(w, http.StatusUnauthorized, responseBody{
+			"error": "Couldn't find JWT",
+		})
+		return
+	}
+
+	// Extract the token string from the Authorization header by stripping off the Bearer prefix
+	tokenString := authHeader[len("Bearer "):]
+
+	// Parse the token using the jwt.ParseWithClaims function
+	keyFunc := func(token *jwt.Token) (interface{}, error) {
+		return []byte(cfg.JWT_SECRET), nil
+	}
+
+	claims := jwt.RegisteredClaims{}
+	token, err := jwt.ParseWithClaims(tokenString, &claims, keyFunc)
+
+	// Check if the token is valid
+	if err != nil || !token.Valid {
+
+		respondWithError(w, 401, responseBody{
+			"error": fmt.Sprint(err),
+		})
+		return
+	}
+
+	// Extract the claims
+	myClaims, ok := token.Claims.(*jwt.RegisteredClaims)
+	if !ok {
+		respondWithError(w, 500, responseBody{
+			"error": "Internal server error",
+		})
+		return
+	}
+
+
+	// get user id
+
+	id := myClaims.Subject
+
+	issuer := myClaims.Issuer
+	if issuer != "chirpy-refresh" {
+
+		respondWithError(w, 401, responseBody{
+			"error": "no refresh token provided",
+		})
+	}
+
+	for i := range cfg.DatabaseMap.RevokedRefreshTokens {
+
+		if tokenString == cfg.DatabaseMap.RevokedRefreshTokens[i].ID {
+			respondWithError(w, 401, responseBody{
+				"error": "refrsh token has been revoked",
+			})
+			return
+		}
+	}
+
+	// Create an access JWT
+	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		Issuer: "chirpy-access",
+		IssuedAt: jwt.NewNumericDate(time.Now()),
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		Subject: fmt.Sprint(id),
+	})
+
+	// Sign the access token with a secret key
+	secretKey := []byte(cfg.JWT_SECRET)
+	signedAccessToken, err := accessToken.SignedString(secretKey)
+	
+
+	if err != nil {
+		fmt.Println("Error signing access token: ", err)
+		respondWithError(w, 500, responseBody{
+			"error": "Internal Server Error",
+		})
+		return
+	}
+
+
+
+	respondWithJSON(w, 200, responseBody2{
+		Token: signedAccessToken,
+	})
+
+
+}
+
+
+
+
+func (cfg *apiConfig) revoke(w http.ResponseWriter, r *http.Request) {
+
+
+	type responseBody map[string]string
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer") || len(authHeader)<=7{
+		respondWithError(w, http.StatusUnauthorized, responseBody{
+			"error": "Couldn't find JWT",
+		})
+		return
+	}
+
+
+	// Extract the token string from the Authorization header by stripping off the Bearer prefix
+	tokenString := authHeader[len("Bearer "):]
+
+	cfg.DatabaseMap.RevokedRefreshTokens[tokenString] = database.RevokedToken{
+		ID: tokenString,
+		Time: time.Now(),
+	}
+	cfg.Database.WriteDB(cfg.DatabaseMap)
+	respondWithJSON(w, 200, responseBody{
+		"error": "None",
+	})
+
+}
+
+
+func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
+
+	
+	
+
+	type responseBody map[string]string
+
+	
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer") {
+		respondWithError(w, http.StatusUnauthorized, responseBody{
+			"error": "Couldn't find JWT",
+		})
+		return
+	}
+
+	tokenString := authHeader[len("Bearer "):]
+
+	keyFunc := func(token *jwt.Token) (interface{}, error) {
+		return []byte(cfg.JWT_SECRET), nil
+	}
+
+	claims := jwt.RegisteredClaims{}
+	token, err := jwt.ParseWithClaims(tokenString, &claims, keyFunc)
+
+	if err != nil || !token.Valid {
+		respondWithError(w, 401, responseBody{
+			"error": fmt.Sprint(err),
+		})
+		return
+	}
+
+	myClaims, ok := token.Claims.(*jwt.RegisteredClaims)
+	if !ok {
+		respondWithError(w, 500, responseBody{
+			"error": "Internal server error",
+		})
+		return
+	}
+
+	userID, err := strconv.Atoi(myClaims.Subject)
+	if err != nil {
+		respondWithError(w, 500, responseBody{
+			"error": "Error while parsing user ID",
+		})
+		return
+	}
+	
+	id := chi.URLParam(r, "chirpID")
+	chirpId, err := strconv.Atoi(id)
+	if err != nil {
+		fmt.Println("Error: ", err)
+		return
+	}
+
+
+	for i := range cfg.DatabaseMap.Chirps {
+
+		if i == chirpId {
+
+			if cfg.DatabaseMap.Chirps[i].AuthorID == userID {
+
+
+				// DELETE THE CHIRP FROM THE DATABASE
+				delete(cfg.DatabaseMap.Chirps, i)
+				cfg.Database.WriteDB(cfg.DatabaseMap)
+				respondWithJSON(w, 200, responseBody{
+					"error": "None",
+				})
+				return
+
+			} else {
+				respondWithError(w, 403, responseBody{
+					"error": "User ID does not match author ID of chirp",
+				})
+				return
+			}
+
+		}
+
+	}
+
+}
+
+
+func (cfg *apiConfig) polka (w http.ResponseWriter, r *http.Request) {
+
+	type responseBody map[string]string
+	type Data struct{
+		UserID int `json:"user_id"`
+	}
+	type parameters struct{
+		Event string `json:"event"`
+		Data Data `json:"data"`
+	}
+
+
+
+	apiKey := r.Header.Get("Authorization")
+
+	if apiKey == "" || !strings.HasPrefix(apiKey, "ApiKey") {
+		respondWithError(w, 401, responseBody{
+			"error": "no api key found in request",
+		})
+		return
+	}
+
+	apiKeyString := apiKey[len("ApiKey "):]
+
+	if cfg.POLKA_KEY != apiKeyString {
+		respondWithError(w, 401, responseBody{
+			"error": "incorrect api key",
+		})
+		return
+	}
+
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, 500, responseBody{
+			"error": "Something went wrong",
+		})
+		return
+	}
+
+
+	event := params.Event
+	userID := params.Data.UserID
+	if event != "user.upgraded" {
+		
+		respondWithJSON(w, 200, responseBody{
+			"error": "Event type unrecognised",
+		})
+		return
+	} else {
+
+		for i := range cfg.DatabaseMap.Users {
+
+			if userID == cfg.DatabaseMap.Users[i].ID {
+				user := cfg.DatabaseMap.Users[i]
+				user.Is_Chirpy_Red = true
+				cfg.DatabaseMap.Users[i] = user
+				cfg.Database.WriteDB(cfg.DatabaseMap)
+				respondWithJSON(w, 200, nil)
+				return
+
+			}
+		}
+
+		respondWithError(w, 404, responseBody{
+			"error": "User not found",
+		})
+	}
 }
